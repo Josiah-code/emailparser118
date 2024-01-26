@@ -1,139 +1,221 @@
-import re
+import os
 import imaplib
-import email
-from openpyxl import load_workbook
-import time
-import phonenumbers
-import logging
-from email.header import decode_header
+import re
+from email import message_from_bytes
+from openpyxl import Workbook
+from bs4 import BeautifulSoup
+from datetime import datetime
 
-# Constants
-RETRY_ATTEMPTS = 3
-RETRY_DELAY_SECONDS = 10
-WAIT_INTERVAL_SECONDS = 30
+# Function to extract location from the email body between specified phrases
+def extract_location(email_body):
+    location_start = email_body.find("Role request Review the request and respond.")
+    location_end = email_body.find("is requesting to be listed")
+    
+    if location_start != -1 and location_end != -1:
+        location = email_body[location_start + len("Role request Review the request and respond."):location_end].strip()
 
-# Configuration
-config = {
-    "server": "md-uk-1.webhostbox.net",
-    "username": "jnjenga@africa118.com",
-    "password": "Naivasha@118"
-}
-
-# Sheet headers
-SHEET_HEADERS = ["Name", "Phone", "Email", "Business Name", "Location"]
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def parse_email_body(body: str) -> tuple:
-    """
-    Extracts relevant information from the body of an email message.
-
-    Args:
-        body (str): The body of the email message.
-
-    Returns:
-        tuple: A tuple containing the extracted information:
-            - name (str): The name extracted from the body.
-            - phone (str): The phone number extracted from the body.
-            - email (str): The email extracted from the body.
-            - business_name (str): The business name extracted from the body.
-            - location (str): The location extracted from the body.
-    """
-    name_match = re.search(r"Name: (.+)", body)
-    phone_match = re.search(r"Phone number: (.+)", body)
-    email_match = re.search(r"Email: (.+)", body)
-    business_location_pattern = re.compile(r"(.+)\n\n.+ requesting to be listed as a manager", re.DOTALL)
-    business_location_match = business_location_pattern.search(body)
-
-    if business_location_match:
-        business_location_text = business_location_match.group(1).strip()
-        business_name, location = business_location_text.split("\n", 1)
+        # Replace '\u200d' with blank spaces and remove extra spaces
+        location = location.replace('\u200d', ' ').strip()
+        location = " ".join(location.split())  # Clean up extra spaces
+        
+        return location
     else:
-        business_name = "N/A"
-        location = "N/A"
+        return "Location Not Found"
 
-    # Additional parsing logic as needed
 
-    return name_match.group(1), phone_match.group(1), email_match.group(1), business_name, location
-
-def process_email(email_msg, subject, sheets):
-    if email_msg.is_multipart():
-        for part in email_msg.walk():
-            content_type = part.get_content_type()
-            if content_type == "text/plain":
-                body = part.get_payload(decode=True).decode("utf-8")
-                break
+# Function to extract the line that starts with '<https://business.google.com/n/' and ends with '>'
+def extract_business_link_line(email_body):
+    link_line = re.search(r'<https://business.google.com/n/[^>]+>', email_body)
+    if link_line:
+        return link_line.group()
     else:
-        body = email_msg.get_payload(decode=True).decode("utf-8")
+        return "Business Link Line Not Found"
 
-    name, phone, email, business_name, location = parse_email_body(body)
+# Function to extract business name from emails with a modified subject
+def extract_business_name(email_body):
+    business_name_match = re.search(r'as (?:an owner|a manager) of (.*?) Business Profile on Google', email_body)
+    if business_name_match:
+        return business_name_match.group(1).strip()
+    else:
+        return "Business Name Not Found"
 
+# Function to extract business name and business link from emails with a modified subject
+def extract_suspended_business_info(email_body):
+    business_info_start = email_body.find("Your Business Profile has been suspended")
+    business_info_end = email_body.find("your Business Profile on Google has been suspended because it was flagged for suspicious activity")
+
+    if business_info_start != -1 and business_info_end != -1:
+        business_info = email_body[business_info_start + len("Your Business Profile has been suspended"):business_info_end].strip()
+        business_name = re.search(r'^(.*?)<', business_info).group(1).strip() if re.search(r'^(.*?)<', business_info) else "Business Name Not Found"
+        business_link = re.search(r'<(https://business.google.com/n/[^>]+) > at', business_info).group(1).strip() if re.search(r'<(https://business.google.com/n/[^>]+) > at', business_info) else "Business Link Not Found"
+        return business_name, business_link
+
+    return "Business Name Not Found", "Business Link Not Found"
+
+# Function to extract email address from email body
+def extract_email_address(email_body):
+    email_match = re.search(r'Email\s*address\s*:\s*([\w\.-]+@[\w\.-]+)', email_body, re.IGNORECASE)
+    if email_match:
+        return email_match.group(1).strip()
+    else:
+        return "Email Address Not Found"
+
+# Function to extract business name from emails with the subject "Your post has been removed from Google"
+def extract_removed_post_business_name(email_body):
+    business_name_match = re.search(r'(.*?) your post has been removed from your Business Profile on Google because it contains content that is considered spam.', email_body, re.DOTALL)
+    if business_name_match:
+        return business_name_match.group(1).strip()
+    else:
+        return "Business Name Not Found"
+
+# Prompt the user to choose between parsing all emails or only unread ones
+parse_all = input("Parse all emails (y/n)? ").strip().lower() == "y"
+
+if parse_all:
+    # Define the date range for email filtering
+    start_date = datetime(2023, 11, 8)  # Replace with your desired start date
+    end_date = datetime(2023, 11, 14)  # Replace with your desired end date
+else:
+    # If not parsing all emails, prompt the user for the start and end dates
+    start_date_str = input("Enter the start date (YYYY-MM-DD): ")
+    end_date_str = input("Enter the end date (YYYY-MM-DD): ")
+    start_date = datetime.strptime(start_date_str, "%Y-%m-%d")
+    end_date = datetime.strptime(end_date_str, "%Y-%m-%d")
+
+# Convert the dates to the required format (DD-Mon-YYYY)
+start_date_str = start_date.strftime("%d-%b-%Y")
+end_date_str = end_date.strftime("%d-%b-%Y")
+
+# Connect to your email server
+mail = imaplib.IMAP4_SSL("md-uk-1.webhostbox.net")
+mail.login("parser@taskmoby.com", "Welcome@118")
+mail.select("inbox")
+
+# Modify the search criteria to filter emails within the date range
+search_criteria = f'(SENTSINCE {start_date_str} SENTBEFORE {end_date_str})'
+
+# If parsing only unread emails, add the UNSEEN criterion
+if not parse_all:
+    search_criteria += 'SEEN'
+
+result, data = mail.search(None, search_criteria)
+email_ids = data[0].split()
+
+# Create a new workbook for suspended emails
+suspended_workbook = Workbook()
+suspended_sheet = suspended_workbook.active
+suspended_sheet.title = "Suspended Emails"
+suspended_sheet.append(['Business Name', 'Business Link Line', 'Email Content'])
+
+# Create the main workbook
+workbook = Workbook()
+sheet = workbook.active
+sheet.append(['Business Name', 'Location', 'Business Link Line', 'Name', 'Phone Number', 'Email', 'Date and Time Sent'])
+
+# Create the "suspended_posts" workbook
+suspended_posts_workbook = Workbook()
+suspended_posts_sheet = suspended_posts_workbook.active
+suspended_posts_sheet.title = "Suspended Posts"
+suspended_posts_sheet.append(['Business Name', 'Email Content'])
+
+for email_id in email_ids:
     try:
-        parsed_phone = phonenumbers.parse(phone, "US")
-        formatted_phone = phonenumbers.format_number(parsed_phone, phonenumbers.PhoneNumberFormat.E164)
+        result, data = mail.fetch(email_id, '(RFC822)')
+        msg = message_from_bytes(data[0][1])
+
+        subject = msg.get("subject", "")
+        print(f"Processing email with subject: {subject}")
+
+        if "You=E2=80=99ve_received_a_management_request" in subject or "You=E2=80=99ve_received_an_ownership_request" in subject:
+            # Process Management or Ownership Request emails
+            content_type = msg.get_content_type()
+            if content_type == "multipart/alternative":
+                email_body = None
+                for part in msg.walk():
+                    part_content_type = part.get_content_type()
+                    if part_content_type == "text/plain" and email_body is None:
+                        email_body = part.get_payload(decode=True).decode()
+                    elif part_content_type == "text/html":
+                        email_body = BeautifulSoup(part.get_payload(decode=True).decode(), 'html.parser').get_text()
+                if email_body:
+                    email_body = ' '.join(email_body.split())
+                    business_name = extract_business_name(email_body)
+                    location = extract_location(email_body).strip()
+                    name = re.search(r'Name:(.*?)(?:,|\n)', email_body, re.DOTALL).group(1).strip() if re.search(r'Name:(.*?)(?:,|\n)', email_body, re.DOTALL) else "Name Not Found"
+                    phone_number = re.search(r'Phone number:\s*([\d\-\+\(\)\s]+)', email_body).group(1).strip() if re.search(r'Phone number:\s*([\d\-\+\(\)\s]+)', email_body) else "Phone Number Not Found"
+                    email_address = re.search(r'Email:\s*([\w\.-]+@[\w\.-]+)', email_body, re.IGNORECASE).group(1).strip() if re.search(r'Email:\s*([\w\.-]+@[\w\.-]+)', email_body, re.IGNORECASE) else "Email Address Not Found"
+                    date_sent = datetime.strptime(msg.get("Date"), "%a, %d %b %Y %H:%M:%S %z").strftime("%Y-%m-%d %H:%M:%S %Z") if msg.get("Date") else "Date Not Found"
+                    business_link_line = extract_business_link_line(email_body)
+
+                    # Print extracted data
+                    print("Business Name:", business_name)
+                    print("Location:", location)
+                    print("Name:", name)
+                    print("Phone Number:", phone_number)
+                    print("Email Address:", email_address)
+                    print("Date and Time Sent:", date_sent)
+                    print("Business Link Line:", business_link_line)
+
+                    # Append extracted data to the main workbook
+                    sheet.append([business_name, location, business_link_line, name, phone_number, email_address, date_sent])
+        elif "your profile has been suspended" in subject.lower():
+            # Process Profile Suspension emails
+            content_type = msg.get_content_type()
+            if content_type == "multipart/alternative":
+                email_body = None
+                for part in msg.walk():
+                    part_content_type = part.get_content_type()
+                    if part_content_type == "text/plain" and email_body is None:
+                        email_body = part.get_payload(decode=True).decode()
+                    elif part_content_type == "text/html":
+                        email_body = BeautifulSoup(part.get_payload(decode=True).decode(), 'html.parser').get_text()
+                if email_body:
+                    email_body = ' '.join(email_body.split())
+                    business_name, business_link_line = extract_suspended_business_info(email_body)
+
+                    # Print extracted data
+                    print("Business Name:", business_name)
+                    print("Business Link Line:", business_link_line)
+                    # Print email content
+                    print("Email Content:", email_body)
+
+                    # Add data to the suspended workbook
+                    suspended_sheet.append([business_name, business_link_line, email_body])
+        elif "Your post has been removed from Google" in subject:
+            # Process Removed Posts emails
+            content_type = msg.get_content_type()
+            if content_type == "multipart/alternative":
+                email_body = None
+                for part in msg.walk():
+                    part_content_type = part.get_content_type()
+                    if part_content_type == "text/plain" and email_body is None:
+                        email_body = part.get_payload(decode=True).decode()
+                    elif part_content_type == "text/html":
+                        email_body = BeautifulSoup(part.get_payload(decode=True).decode(), 'html.parser').get_text()
+                if email_body:
+                    email_body = ' '.join(email_body.split())
+                    business_name = extract_removed_post_business_name(email_body)
+
+                    # Print extracted data
+                    print("Business Name:", business_name)
+                    # Print email content
+                    print("Email Content:", email_body)
+
+                    # Add data to the suspended_posts workbook
+                    suspended_posts_sheet.append([business_name, email_body])
     except Exception as e:
-        logging.error(f"Error while parsing phone number: {e}")
-        return
+        print(f"Error processing email ID {email_id}: {str(e)}")
 
-    sheet = sheets.get(subject)
-    if not sheet:
-        logging.warning("Unrecognized subject: %s", subject)
-        return
+# Save the main workbook
+desktop_path = os.path.join(os.path.expanduser("~"), "Desktop")
+parsed_data_file = os.path.join(desktop_path, "parsed_data.xlsx")
+workbook.save(parsed_data_file) 
 
-    sheet.append([name, formatted_phone, email, business_name, location])
+# Save the suspended workbook as a separate file
+suspended_workbook.save(os.path.join(desktop_path, "suspended_gbp_profiles.xlsx"))
 
-def search_emails(mailbox):
-    for retry in range(RETRY_ATTEMPTS):
-        try:
-            status, email_ids = mailbox.search(None, "UNSEEN")
-            return email_ids[0].split() if email_ids else []
-        except Exception as e:
-            logging.error(f"Error while searching for emails: {e}")
-            logging.info(f"Retrying after {RETRY_DELAY_SECONDS} seconds...")
-            time.sleep(RETRY_DELAY_SECONDS)
-    return []
+# Save the "suspended_posts" workbook as a separate file
+suspended_posts_workbook.save(os.path.join(desktop_path, "suspended_posts.xlsx"))
 
-def main():
-    # Connect to email account
-    with imaplib.IMAP4_SSL(config["server"]) as mail:
-        mail.login(config["username"], config["password"])
-        mail.select("inbox")
-
-        # Create Excel workbooks and sheets
-        sheets = {}
-
-        for sheet_name in ["Ownership Requests", "Management Requests", "Profile Suspensions"]:
-            path = f"{sheet_name.lower().replace(' ', '_')}.xlsx"
-            workbook = load_workbook(path)
-            worksheet = workbook.active
-            worksheet.title = sheet_name
-            if worksheet.max_row == 1:
-                worksheet.append(SHEET_HEADERS)
-            sheets[sheet_name] = worksheet
-
-        try:
-            while True:
-                email_ids = search_emails(mail)
-
-                for email_id in email_ids:
-                    _, data = mail.fetch(email_id, "(BODY.PEEK[])")
-                    raw_email = data[0][1]
-                    msg = email.message_from_bytes(raw_email)
-                    subject = msg["subject"]
-                    process_email(msg, subject, sheets)
-
-                    mail.store(email_id, '+FLAGS', '\\Seen')
-
-                for sheet_name, worksheet in sheets.items():
-                    workbook = worksheet.parent
-                    workbook.save(f"{sheet_name.lower().replace(' ', '_')}.xlsx")
-                    workbook.close()
-
-                time.sleep(WAIT_INTERVAL_SECONDS)
-
-        except KeyboardInterrupt:
-            logging.info("Email parsing stopped.")
-
-if __name__ == "__main__":
-    main()
+# Logout from the email server
+mail.logout()
